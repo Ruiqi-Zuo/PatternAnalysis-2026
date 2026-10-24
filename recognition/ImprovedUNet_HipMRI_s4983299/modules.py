@@ -1,11 +1,11 @@
 """
-Model components for HipMRI 2D prostate segmentation.
+Model components for HipMRI prostate segmentation.
 
 Contains:
     - UNet2D:          baseline 2D U-Net (Ronneberger et al., 2015)
-    - ImprovedUNet2D:  2D Improved U-Net with residual context modules,
+    - ImprovedUNet3D:  3D Improved U-Net with pre-activation residual context modules,
                        localisation modules and deep supervision (Isensee et al., 2017)
-    - DiceLoss:        multi-class soft Dice loss
+    - DiceLoss:        multi-class soft Dice loss (2D or 3D)
     - DiceCELoss:      soft Dice + cross-entropy (used for training)
 
 All components are implemented in PyTorch only (no NumPy).
@@ -94,9 +94,125 @@ class UNet2D(nn.Module):
 # --------------------------------------------------------------------------- #
 # Improved U-Net
 # --------------------------------------------------------------------------- #
-# TODO: Improved U-Net
-class ImprovedUNet2D(nn.Module):
-    pass
+def conv_norm_act(in_ch, out_ch, kernel_size=3, stride=1):
+    """Conv3d -> InstanceNorm3d -> LeakyReLU(0.01)."""
+    return nn.Sequential(
+        nn.Conv3d(in_ch, out_ch, kernel_size, stride=stride, padding=kernel_size // 2, bias=False),
+        nn.InstanceNorm3d(out_ch, affine=True),
+        nn.LeakyReLU(0.01, inplace=True),
+    )
+
+
+class ContextModule(nn.Module):
+    """
+    Pre-activation residual block: (IN -> LReLU -> Conv3) -> Dropout -> (IN -> LReLU -> Conv3).
+
+    The caller adds its input back (x + context(x)), as in the paper.
+    """
+
+    def __init__(self, ch, dropout=0.3):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.InstanceNorm3d(ch, affine=True),
+            nn.LeakyReLU(0.01, inplace=True),
+            nn.Conv3d(ch, ch, 3, padding=1, bias=False),
+            nn.Dropout3d(dropout),
+            nn.InstanceNorm3d(ch, affine=True),
+            nn.LeakyReLU(0.01, inplace=True),
+            nn.Conv3d(ch, ch, 3, padding=1, bias=False),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class UpsamplingModule(nn.Module):
+    """Nearest-neighbour x2 upscale followed by a 3x3x3 conv that halves the channels."""
+
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode="nearest")
+        self.conv = conv_norm_act(in_ch, out_ch)
+
+    def forward(self, x):
+        return self.conv(self.up(x))
+
+
+class LocalisationModule(nn.Module):
+    """3x3x3 conv on the concatenated features, then 1x1x1 conv halving the channels."""
+
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.block = nn.Sequential(conv_norm_act(in_ch, in_ch), conv_norm_act(in_ch, out_ch, kernel_size=1))
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class ImprovedUNet3D(nn.Module):
+    """
+    3D Improved U-Net (Isensee et al., 2017, "Brain tumor segmentation and radiomics
+    survival prediction: contribution to the BRATS 2017 challenge").
+
+    Encoder (5 levels, channels base * [1, 2, 4, 8, 16]):
+        level 1: conv3 -> x + context(x)
+        level k: stride-2 conv3 (downsampling) -> x + context(x)
+    Decoder:
+        upsampling module -> concat skip -> localisation module (levels 4..2)
+        level 1: concat skip -> conv3
+    Deep supervision: 1x1x1 segmentation layers at decoder levels 3, 2 and 1; the coarser
+        maps are upscaled and added element-wise to the finer ones, so gradients reach the
+        deeper decoder levels directly (helps small structures such as the prostate).
+
+    InstanceNorm is used instead of BatchNorm because 3D batches hold only 1-2 volumes.
+    Input (B, in_channels, D, H, W) with D, H, W divisible by 16; output logits
+    (B, num_classes, D, H, W).
+    """
+
+    def __init__(self, in_channels=1, num_classes=6, base=16, dropout=0.3):
+        super().__init__()
+        chs = [base * m for m in (1, 2, 4, 8, 16)]
+
+        # encoder
+        self.stem = conv_norm_act(in_channels, chs[0])
+        self.down = nn.ModuleList([conv_norm_act(chs[i - 1], chs[i], stride=2) for i in range(1, 5)])
+        self.context = nn.ModuleList([ContextModule(c, dropout) for c in chs])
+
+        # decoder: up[i] goes from level 4-i+1 to level 4-i (0-based: 4->3, 3->2, 2->1, 1->0)
+        self.up = nn.ModuleList([UpsamplingModule(chs[i], chs[i - 1]) for i in (4, 3, 2, 1)])
+        self.loc = nn.ModuleList([LocalisationModule(chs[i] * 2, chs[i]) for i in (3, 2, 1)])
+        self.final_conv = conv_norm_act(chs[0] * 2, chs[0] * 2)
+
+        # deep supervision heads (levels 3, 2 and full resolution)
+        self.seg3 = nn.Conv3d(chs[2], num_classes, 1)
+        self.seg2 = nn.Conv3d(chs[1], num_classes, 1)
+        self.seg1 = nn.Conv3d(chs[0] * 2, num_classes, 1)
+        self.upscale = nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False)
+
+    def forward(self, x):
+        # encoder
+        x = self.stem(x)
+        x = x + self.context[0](x)
+        skips = [x]
+        for down, ctx in zip(self.down, self.context[1:]):
+            x = down(x)
+            x = x + ctx(x)
+            skips.append(x)
+        x = skips.pop()  # bottleneck (level 5)
+
+        # decoder levels 4, 3, 2 with localisation modules
+        seg_maps = []
+        for up, loc in zip(self.up[:3], self.loc):
+            x = loc(torch.cat([skips.pop(), up(x)], dim=1))
+            seg_maps.append(x)
+
+        # level 1 (full resolution)
+        x = self.final_conv(torch.cat([skips.pop(), self.up[3](x)], dim=1))
+
+        # deep supervision: seg maps from level 3 and 2 are upscaled and summed into level 1
+        _, level3, level2 = seg_maps
+        out = self.upscale(self.seg3(level3)) + self.seg2(level2)
+        return self.upscale(out) + self.seg1(x)
 
 
 # --------------------------------------------------------------------------- #
@@ -127,11 +243,11 @@ class DiceLoss(nn.Module):
         self.eps = eps
 
     def forward(self, logits, target):
-        # logits (B, C, H, W), target (B, H, W) int64
-        probs = F.softmax(logits, dim=1)
-        one_hot = F.one_hot(target, self.num_classes).permute(0, 3, 1, 2).to(probs.dtype)
+        # logits (B, C, *spatial), target (B, *spatial) int64; works for 2D and 3D
+        probs = F.softmax(logits.float(), dim=1)
+        one_hot = F.one_hot(target, self.num_classes).movedim(-1, 1).to(probs.dtype)
 
-        dims = (0, 2, 3)  # sum over batch and spatial dims -> one value per class
+        dims = (0, *range(2, logits.dim()))  # sum over batch and spatial dims -> one value per class
         intersection = (probs * one_hot).sum(dims)
         denominator = probs.sum(dims) + one_hot.sum(dims)
         dice = (2 * intersection + self.eps) / (denominator + self.eps)
@@ -166,20 +282,50 @@ def count_parameters(model):
 
 
 if __name__ == "__main__":
-    # Smoke test: shapes, parameter count, loss sanity and one backward pass
+    # Smoke test: shapes, parameter count, loss sanity, one training step and its cost
+    import time
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = UNet2D().to(device)
-    x = torch.randn(4, 1, 256, 128, device=device)
-    y = torch.randint(0, 6, (4, 256, 128), device=device)
-
-    logits = model(x)
-    print(f"UNet2D output {tuple(logits.shape)}, params {count_parameters(model):,}")
-
     loss_fn = DiceCELoss()
-    loss = loss_fn(logits, y)
-    loss.backward()
-    print(f"DiceCE loss on random input: {loss.item():.4f}")
 
-    # a perfect prediction must give Dice loss ~0
-    perfect = F.one_hot(y, 6).permute(0, 3, 1, 2).float() * 100
-    print(f"Dice loss for perfect logits: {DiceLoss()(perfect, y).item():.6f}")
+    def profile(model, shape, batch, steps=3):
+        """Run a few bf16 training steps on random data; return output shape and costs."""
+        model = model.to(device)
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+        x = torch.randn(batch, 1, *shape, device=device)
+        y = torch.randint(0, 6, (batch, *shape), device=device)
+        if device == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+        for step in range(steps + 1):  # first step is warm-up
+            if step == 1:
+                if device == "cuda":
+                    torch.cuda.synchronize()
+                t0 = time.time()
+            with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=device == "cuda"):
+                logits = model(x)
+                loss = loss_fn(logits, y)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+        if device == "cuda":
+            torch.cuda.synchronize()
+        dt = (time.time() - t0) / steps
+        vram = torch.cuda.max_memory_allocated() / 1024 ** 3 if device == "cuda" else float("nan")
+        return tuple(logits.shape), loss.item(), dt, vram
+
+    for name, model, shape, batch in [
+        ("UNet2D", UNet2D(), (256, 128), 16),
+        ("ImprovedUNet3D", ImprovedUNet3D(), (128, 144, 128), 2),
+    ]:
+        out, loss, dt, vram = profile(model, shape, batch)
+        print(f"{name:15s} out {out}  params {count_parameters(model):,}  "
+              f"loss {loss:.3f}  {dt:.3f}s/step  peak VRAM {vram:.2f} GiB (bf16, batch {batch})")
+        del model
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+    # a perfect prediction must give Dice loss ~0 (2D and 3D)
+    for shape in [(2, 64, 32), (1, 16, 16, 16)]:
+        y = torch.randint(0, 6, shape)
+        perfect = F.one_hot(y, 6).movedim(-1, 1).float() * 100
+        print(f"Dice loss for perfect logits, target {shape}: {DiceLoss()(perfect, y).item():.6f}")

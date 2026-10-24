@@ -7,7 +7,7 @@ and saves visualisations (input, ground truth, prediction, FP/FN overlay).
 Author: Ruiqi Zuo (s4983299)
 """
 
-from modules import UNet2D, ImprovedUNet2D
+from modules import UNet2D, ImprovedUNet3D
 from dataset import get_dataloaders
 
 
