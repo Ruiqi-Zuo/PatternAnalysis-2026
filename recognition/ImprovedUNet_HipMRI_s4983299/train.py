@@ -2,13 +2,22 @@
 Training, validation, testing and saving of the segmentation models.
 
 Usage:
-    python train.py --model unet --epochs 30          # baseline 2D U-Net
-    python train.py --root ~/data/keras_slices_data --out runs/unet_seed0
+    # baseline 2D U-Net on coronal slices
+    python train.py --model unet --epochs 30 --out runs/unet_seed0
+
+    # 3D Improved U-Net on cropped volumes (bf16 mixed precision on GPU)
+    python train.py --model improved3d --epochs 20 --out runs/improved3d_seed0
+
+    # Rangpur: data from the course directory, cache in $HOME, resume after interruption
+    python train.py --model improved3d --root /home/groups/comp3710/HipMRI_Study_open \
+        --cache-dir ~/cache/hipmri3d_crop --resume
 
 Outputs (in --out):
     best.pth        weights with the highest validation prostate Dice (mean per scan)
+    last.pth        full training state of the latest epoch (for --resume)
     history.json    per-epoch losses / metrics, resource usage, final test metrics
     curves.png      training loss and validation Dice curves
+    train.log       copy of the console output
 
 Model is imported from modules.py, data loaders from dataset.py.
 The test split is only evaluated once, with the best validation checkpoint.
@@ -26,10 +35,26 @@ from collections import defaultdict
 import numpy as np
 import torch
 
-from dataset import get_dataloaders, CLASS_NAMES, NUM_CLASSES, PROSTATE
-from modules import UNet2D, DiceCELoss, count_parameters
+from dataset import get_dataloaders, get_dataloaders_3d, CLASS_NAMES, NUM_CLASSES, PROSTATE
+from modules import UNet2D, ImprovedUNet3D, DiceCELoss, count_parameters
 
-MODELS = {"unet": UNet2D}
+# model name -> (class, is_3d, default data root, default batch size, default lr)
+MODELS = {
+    "unet": (UNet2D, False, "~/data/keras_slices_data", 16, 1e-3),
+    "improved3d": (ImprovedUNet3D, True, "~/data/HipMRI_3D", 2, 5e-4),
+}
+
+
+class Logger:
+    """Print to the console and append to a log file (flushed every line)."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def __call__(self, msg):
+        print(msg, flush=True)
+        with open(self.path, "a") as f:
+            f.write(msg + "\n")
 
 
 def set_seed(seed):
@@ -40,7 +65,13 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def train_one_epoch(model, loader, loss_fn, optimizer, device):
+def autocast(device, enabled):
+    """bf16 autocast on CUDA (no-op otherwise); bf16 needs no gradient scaler."""
+    return torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                          enabled=enabled and device.type == "cuda")
+
+
+def train_one_epoch(model, loader, loss_fn, optimizer, device, amp):
     """Run one training epoch and return the mean loss."""
     model.train()
     total, n = 0.0, 0
@@ -49,7 +80,8 @@ def train_one_epoch(model, loader, loss_fn, optimizer, device):
         mask = mask.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        loss = loss_fn(model(image), mask)
+        with autocast(device, amp):
+            loss = loss_fn(model(image), mask)
         loss.backward()
         optimizer.step()
 
@@ -65,13 +97,13 @@ def _dice(tp, fp, fn):
 
 
 @torch.no_grad()
-def evaluate(model, loader, loss_fn, device):
+def evaluate(model, loader, loss_fn, device, amp=True):
     """
-    Evaluate on a split.
+    Evaluate on a split (2D slices or 3D volumes).
 
     Returns a dict with:
         loss:                 mean loss
-        dice / iou:           per-class scores over the whole split (pixels pooled)
+        dice / iou:           per-class scores over the whole split (voxels pooled)
         prostate_dice_scan:   prostate Dice averaged over scans (each scan = one 3D volume),
                               matching the per-volume acceptance criteria
     """
@@ -85,8 +117,9 @@ def evaluate(model, loader, loss_fn, device):
     for image, mask, meta in loader:
         image = image.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
-        logits = model(image)
-        total += loss_fn(logits, mask).item() * image.size(0)
+        with autocast(device, amp):
+            logits = model(image)
+            total += loss_fn(logits, mask).item() * image.size(0)
         n += image.size(0)
 
         pred = logits.argmax(dim=1)
@@ -96,11 +129,12 @@ def evaluate(model, loader, loss_fn, device):
             fp[c] += (p & ~g).sum().item()
             fn[c] += (~p & g).sum().item()
 
-        # per-slice prostate counts, accumulated into their scan
+        # per-sample prostate counts, accumulated into their scan
+        spatial = tuple(range(1, pred.dim()))
         p, g = pred == PROSTATE, mask == PROSTATE
-        s_tp = (p & g).sum(dim=(1, 2)).cpu()
-        s_fp = (p & ~g).sum(dim=(1, 2)).cpu()
-        s_fn = (~p & g).sum(dim=(1, 2)).cpu()
+        s_tp = (p & g).sum(dim=spatial).cpu()
+        s_fp = (p & ~g).sum(dim=spatial).cpu()
+        s_fn = (~p & g).sum(dim=spatial).cpu()
         for i in range(image.size(0)):
             key = (int(meta["case"][i]), int(meta["week"][i]))
             scan_counts[key][0] += s_tp[i].item()
@@ -141,7 +175,7 @@ def plot_curves(history, path):
     for c in range(1, NUM_CLASSES):
         ax2.plot(epochs, val_dice[:, c], label=CLASS_NAMES[c], lw=2.5 if c == PROSTATE else 1)
     ax2.plot(epochs, history["val_prostate_dice_scan"], "k--", label="prostate (mean per scan)")
-    ax2.axhline(0.75, color="grey", ls=":", lw=1)
+    ax2.axhline(0.7, color="grey", ls=":", lw=1)
     ax2.set_xlabel("epoch"); ax2.set_ylabel("Dice"); ax2.set_ylim(0, 1)
     ax2.set_title("Validation Dice"); ax2.legend(fontsize=8)
     fig.tight_layout()
@@ -150,40 +184,76 @@ def plot_curves(history, path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train a HipMRI 2D segmentation model")
+    parser = argparse.ArgumentParser(description="Train a HipMRI segmentation model")
     parser.add_argument("--model", choices=MODELS, default="unet")
-    parser.add_argument("--root", default=os.path.expanduser("~/data/keras_slices_data"))
-    parser.add_argument("--out", default="runs/unet_seed0")
+    parser.add_argument("--root", default=None, help="data directory (default depends on --model)")
+    parser.add_argument("--cache-dir", default=None, help="3D only: where cropped volumes are cached")
+    parser.add_argument("--out", default=None, help="default: runs/<model>_seed<seed>")
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--no-amp", action="store_true", help="disable bf16 mixed precision")
+    parser.add_argument("--resume", action="store_true", help="continue from <out>/last.pth if present")
     args = parser.parse_args()
+
+    model_cls, is_3d, default_root, default_bs, default_lr = MODELS[args.model]
+    args.root = os.path.expanduser(args.root or default_root)
+    args.cache_dir = os.path.expanduser(args.cache_dir) if args.cache_dir else None
+    args.batch_size = args.batch_size or default_bs
+    args.lr = args.lr or default_lr
+    args.out = args.out or f"runs/{args.model}_seed{args.seed}"
+    amp = not args.no_amp
 
     set_seed(args.seed)
     os.makedirs(args.out, exist_ok=True)
+    log = Logger(os.path.join(args.out, "train.log"))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_loader, val_loader, test_loader = get_dataloaders(args.root, args.batch_size, args.num_workers)
-    model = MODELS[args.model](in_channels=1, num_classes=NUM_CLASSES).to(device)
+    if is_3d:
+        train_loader, val_loader, test_loader = get_dataloaders_3d(
+            args.root, args.batch_size, args.num_workers, cache_dir=args.cache_dir)
+    else:
+        train_loader, val_loader, test_loader = get_dataloaders(args.root, args.batch_size, args.num_workers)
+
+    model = model_cls(in_channels=1, num_classes=NUM_CLASSES).to(device)
     loss_fn = DiceCELoss(NUM_CLASSES)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    print(f"model {args.model}: {count_parameters(model):,} parameters, device {device}")
-    print(f"train {len(train_loader.dataset)} / val {len(val_loader.dataset)} / test {len(test_loader.dataset)} slices")
-
     history = defaultdict(list)
+    best_score, best_epoch, start_epoch = -1.0, 0, 1
+    last_path = os.path.join(args.out, "last.pth")
+    if args.resume and os.path.exists(last_path):
+        state = torch.load(last_path, map_location=device, weights_only=False)
+        saved_epochs = state["history"]["args"]["epochs"]
+        if saved_epochs != args.epochs:
+            # the cosine schedule length is fixed at the start; changing it would leave lr = 0
+            raise SystemExit(f"--epochs {args.epochs} differs from the resumed run ({saved_epochs})")
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        history.update(state["history"])
+        best_score, best_epoch = state["best_score"], state["best_epoch"]
+        start_epoch = state["epoch"] + 1
+        torch.set_rng_state(state["rng_cpu"].cpu())  # map_location moved it to the GPU
+        log(f"resumed from epoch {state['epoch']} (best {best_score:.3f} at epoch {best_epoch})")
     history["args"] = vars(args)
-    best_score, best_epoch = -1.0, 0
+
+    unit = "volumes" if is_3d else "slices"
+    gpu = torch.cuda.get_device_name(0) if device.type == "cuda" else "cpu"
+    log(f"model {args.model}: {count_parameters(model):,} parameters | {gpu} | bf16 {amp}")
+    log(f"train {len(train_loader.dataset)} / val {len(val_loader.dataset)} / "
+        f"test {len(test_loader.dataset)} {unit} | batch {args.batch_size} | lr {args.lr}")
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
-        train_loss = train_one_epoch(model, train_loader, loss_fn, optimizer, device)
-        val = evaluate(model, val_loader, loss_fn, device)
+        train_loss = train_one_epoch(model, train_loader, loss_fn, optimizer, device, amp)
+        val = evaluate(model, val_loader, loss_fn, device, amp)
         scheduler.step()
         elapsed = time.time() - t0
 
@@ -198,25 +268,32 @@ def main():
             best_score, best_epoch = val["prostate_dice_scan"], epoch
             torch.save(model.state_dict(), os.path.join(args.out, "best.pth"))
             flag = " *"
-        print(f"[{epoch:3d}/{args.epochs}] {elapsed:5.1f}s train {train_loss:.4f} | val {format_metrics(val)}{flag}",
-              flush=True)
+        torch.save({
+            "epoch": epoch, "model": model.state_dict(), "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(), "history": dict(history),
+            "best_score": best_score, "best_epoch": best_epoch, "rng_cpu": torch.get_rng_state(),
+        }, last_path)
+        log(f"[{epoch:3d}/{args.epochs}] {elapsed:5.1f}s train {train_loss:.4f} | val {format_metrics(val)}{flag}")
 
     plot_curves(history, os.path.join(args.out, "curves.png"))
 
     # Final test evaluation with the best validation checkpoint (test split used only here)
     model.load_state_dict(torch.load(os.path.join(args.out, "best.pth"), map_location=device))
-    test = evaluate(model, test_loader, loss_fn, device)
-    print(f"best epoch {best_epoch} (val prostate/scan {best_score:.3f})")
-    print(f"TEST {format_metrics(test)}")
-    print("TEST IoU " + " ".join(f"{n[:4]} {v:.3f}" for n, v in zip(CLASS_NAMES[1:], test["iou"][1:])))
+    t0 = time.time()
+    test = evaluate(model, test_loader, loss_fn, device, amp)
+    infer_time = (time.time() - t0) / len(test_loader.dataset)
+    log(f"best epoch {best_epoch} (val prostate/scan {best_score:.3f})")
+    log(f"TEST {format_metrics(test)}")
+    log("TEST IoU " + " ".join(f"{n[:4]} {v:.3f}" for n, v in zip(CLASS_NAMES[1:], test["iou"][1:])))
 
     history["best_epoch"] = best_epoch
     history["test"] = test
     history["parameters"] = count_parameters(model)
+    history["test_seconds_per_" + unit[:-1]] = infer_time
     if device.type == "cuda":
-        history["peak_train_vram_gb"] = torch.cuda.max_memory_allocated() / 1024 ** 3
-        print(f"peak VRAM {history['peak_train_vram_gb']:.2f} GB, "
-              f"mean epoch {np.mean(history['epoch_time']):.1f}s")
+        history["peak_vram_gb"] = torch.cuda.max_memory_allocated() / 1024 ** 3
+        log(f"peak VRAM {history['peak_vram_gb']:.2f} GB (this session), "
+            f"mean epoch {np.mean(history['epoch_time']):.1f}s, test {infer_time * 1000:.1f} ms/{unit[:-1]}")
     with open(os.path.join(args.out, "history.json"), "w") as f:
         json.dump(history, f, indent=2)
 
