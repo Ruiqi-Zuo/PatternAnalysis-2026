@@ -7,6 +7,8 @@ data/
 checkpoints/
 outputs/
 runs/
+results/
+predictions/
 slurm-*.out
 __pycache__/
 *.pyc
