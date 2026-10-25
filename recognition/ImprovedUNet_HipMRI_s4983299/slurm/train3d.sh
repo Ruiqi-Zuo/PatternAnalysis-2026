@@ -10,9 +10,10 @@
 
 #SBATCH --job-name=iunet3d
 #SBATCH --partition=comp3710
+#SBATCH --account=comp3710
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
+# no --mem: comp3710 nodes advertise almost no schedulable memory, so any --mem request is rejected
 #SBATCH --time=12:00:00
 #SBATCH --output=slurm-%x-%j.out
 
