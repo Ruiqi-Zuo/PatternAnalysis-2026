@@ -144,7 +144,64 @@ Every number in this section can be reproduced with the scripts in [`scripts/`](
 **Fallback:** if memory or time runs out, train on 96³–128³ patches with sliding-window inference, and reduce base filters from 16 to 8. If the 3D model still cannot reach A1 in time, fall back to the 2D Improved U-Net [Normal], reusing the working 2D pipeline. If 3D passes A1 but not A2, the recommendation becomes: auto-draft central slices, and flag the outer 3 prostate slices for mandatory manual contouring. *Outcome: no fallback was needed for memory or A1. The last case, passing A1 but not A2, is what happened (Section 7.4).*
 
 ## 3. Dependencies and Reproducibility
-<!-- TODO: exact package versions, random seeds, hardware -->
+
+### 3.1 Software
+
+```bash
+conda create -n torch python=3.11 pip -y && conda activate torch
+pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cu130
+pip install -r requirements.txt
+```
+
+| Package | Version | Used for |
+|---|---|---|
+| Python | 3.11.15 | |
+| PyTorch | 2.13.0 (CUDA 13.0, cuDNN 9.20) | all models, training and inference. `modules.py` uses PyTorch only |
+| torchvision | 0.28.0 | joint image / mask augmentation of 2D slices (`transforms.v2`) |
+| nibabel | 5.4.2 | reading Nifti slices and volumes, writing predicted masks |
+| NumPy | 2.4.6 | data loading and evaluation (not used by the models) |
+| SciPy | 1.17.1 | HD95 distance transforms and connected components in `evaluate.py` |
+| Matplotlib | 3.11.1 | training curves and figures |
+
+The versions above are from the local environment (WSL2 Ubuntu 22.04, NVIDIA driver 616.56). The Rangpur environment used for the A100 runs: <!-- TODO: fill from Rangpur --> **to be filled**.
+
+### 3.2 Hardware and training runs
+
+All reported results come from four training runs, two seeds per model:
+
+| Run | Hardware | Epochs | Time / epoch | Total | Best validation epoch | Peak training memory |
+|---|---|---|---|---|---|---|
+| 2D U-Net, seed 0 | Rangpur A100-PCIE-40GB | 30 | 40.0 s | 20 min | 14 | 0.85 GB |
+| 2D U-Net, seed 1 | RTX 4070 Laptop GPU, 8 GB | 30 | 199 s* | 99 min | 23 | 0.86 GB |
+| 3D Improved U-Net, seed 0 | Rangpur A100-PCIE-40GB | 150 | 16.9 s | 42 min | 38 | 4.44 GB |
+| 3D Improved U-Net, seed 1 | Rangpur A100-PCIE-40GB | 150 | 16.9 s | 42 min | 74 | 4.44 GB |
+
+\* The laptop GPU was throttled during this run, so its time is not comparable with the A100 times.
+
+Data audits, the smoke test, evaluation (`evaluate.py`) and prediction (`predict.py`) ran on the laptop GPU.
+
+### 3.3 Training configuration
+
+Both models share the following settings:
+- **Optimiser:** Adam with weight decay 1e-5, and a cosine learning-rate schedule that decays to 0 over the run.
+- **Loss:** soft Dice (foreground classes, pooled over the batch) + cross-entropy, equally weighted.
+- **Precision:** bf16 autocast.
+- **Checkpoint:** the epoch with the highest validation prostate Dice averaged per scan. The test split is evaluated once, at the end.
+
+| | 2D U-Net | 3D Improved U-Net |
+|---|---|---|
+| Input | 1 × 256 × 128 coronal slice, per-slice z-score | 1 × 128 × 144 × 128 crop, per-volume z-score |
+| Batch size | 16 | 2 |
+| Learning rate | 1e-3 | 5e-4 (as in [2]) |
+| Epochs | 30 | 150 |
+| Augmentation (train only) | left-right flip, rotation ±10°, translation ±5 %, scale 0.9–1.1 | left-right flip, rotation ±10° about each axis, scale 0.9–1.1, intensity × U(0.9, 1.1) + U(−0.1, 0.1) |
+
+### 3.4 Determinism and what is not in the repository
+
+- **Seeds:** `train.py --seed` seeds Python, NumPy and PyTorch (CPU and CUDA). Augmentation draws only from the PyTorch generator, and DataLoader workers derive their seeds from it.
+- **Remaining non-determinism:** cuDNN's deterministic mode is not enabled because it slows training, and bf16 reductions differ between GPUs. Re-running the same command therefore reproduces results to about ±0.01 Dice, not bit-exactly. For example, the smoke-test re-run gave 0.854 against 0.843 at the check-off (Section 2.3). For this reason every conclusion in Section 7 is based on two seeds per model and is compared with the run-to-run gap.
+- **Data split:** the official `keras_slices_data` split is used. The 3D split is defined in code (`dataset.VAL_CASES`, `dataset.TEST_CASES`), and `check_patient_disjoint` verifies on every run that no patient appears in two splits.
+- **Not committed:** the datasets and model weights (`*.pth`) are excluded by `.gitignore`, as the assessment requires. The data is on Rangpur under `/home/groups/comp3710/HipMRI_Study_open/` (`keras_slices_data`, `semantic_MRs`, `semantic_labels_only`). Section 5 gives the commands that regenerate every checkpoint and result.
 
 ## 4. Data Pre-processing and Splits
 <!-- TODO: normalisation, augmentation, patient-level split justification -->
