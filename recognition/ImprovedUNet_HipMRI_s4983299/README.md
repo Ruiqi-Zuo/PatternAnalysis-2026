@@ -204,7 +204,60 @@ Both models share the following settings:
 - **Not committed:** the datasets and model weights (`*.pth`) are excluded by `.gitignore`, as the assessment requires. The data is on Rangpur under `/home/groups/comp3710/HipMRI_Study_open/` (`keras_slices_data`, `semantic_MRs`, `semantic_labels_only`). Section 5 gives the commands that regenerate every checkpoint and result.
 
 ## 4. Data Pre-processing and Splits
-<!-- TODO: normalisation, augmentation, patient-level split justification -->
+
+The facts about the data (shapes, spacing, orientation, class balance) are in Section 2.3. This section describes what is done to the data and why. All of it is implemented in [`dataset.py`](dataset.py).
+
+### 4.1 Patient-level split
+
+| Split | Patients | Scans (3D volumes) | 2D slices | Used for |
+|---|---|---|---|---|
+| Train | 31 (004–035, no 034) | 191 | 11,460 | gradient updates |
+| Validate | 4 (036–039) | 11 | 660 | choosing the checkpoint |
+| Test | 3 (040–042) | 9 | 540 | final evaluation only (Section 7) |
+
+- **The patient is the unit of the split.** 22 of the 38 patients have 8 weekly scans of the same anatomy, and neighbouring slices of one scan are almost identical. A split by slice or by scan would put near-copies of a test patient into training and inflate the test Dice.
+- **The official `keras_slices_data` split is used as given.** `check_patient_disjoint` confirms on every run that no patient is in two splits. The 3D volumes are assigned to the same splits through the case ID in their file names (Section 2.3). Both models are therefore trained, selected and tested on identical patients, which a paired comparison requires.
+- **The validation split only selects the checkpoint** (highest prostate Dice averaged per scan), and it was used to check that the 20-epoch 3D pilot was learning. No hyperparameter search was run. The test split is scored only with the selected checkpoint of each run, and nothing was chosen based on test results.
+- **Limitation: the held-out splits are small and unbalanced.** Patient 039 contributes 8 of the 11 validation scans, and patient 040 contributes 7 of the 9 test scans. The test set therefore holds 3 independent patients, not 9 independent samples, and a mean over the 9 volumes mostly reflects patient 040. For this reason Section 7 reports results per patient and for two seeds. Patient-level cross-validation would give a tighter estimate, but it would cost about five times the GPU time and would no longer use the course's common split.
+
+### 4.2 2D baseline: per-slice pre-processing
+
+Applied in `HipMRI2DDataset.__getitem__`, in this order:
+
+1. **Unify the size:** centre-crop or zero-pad every slice to 256 × 128. The only slices of a different size are the 60 slices of one training scan (case 019, week 1, with 144 axial planes), which lose 8 axial planes at each end. Cropping is used instead of resizing because it keeps the mask labels as integers and keeps the image and mask aligned pixel for pixel.
+2. **Augment (training only):** a vertical flip with p = 0.5 and a random affine transform (rotation ±10°, translation ±5 %, scale 0.9–1.1). The image's vertical axis is the patient's left–right axis, so the flip is an anatomically plausible mirror of a roughly symmetric pelvis. The inferior–superior axis is never flipped, because the difference between apex and base is exactly what the model must learn. Image and mask are transformed together as `tv_tensors`: bilinear interpolation for the image and nearest-neighbour for the mask, so every mask pixel keeps a valid label.
+3. **Normalise:** z-score per slice. MR intensities have no absolute units and their range differs between scans (0 to about 1000), so each slice is standardised on its own. This step runs after augmentation, so the area that a rotation exposes is filled with 0, the intensity of the air background, before normalisation.
+
+No re-sampling by class is done. All slices are kept, including the 64 % that contain no prostate, so the model learns to predict "no prostate" beyond the ends of the gland, which criterion A2 penalises. The class imbalance is handled by the Dice term of the loss instead.
+
+### 4.3 3D Improved U-Net: per-volume pre-processing
+
+Applied in `load_volume` (once, then cached) and `augment_volume` (every training step):
+
+1. **Fixed crop:** `CROP_3D` keeps voxels [64, 192) × [48, 192) × [0, 128) along left–right, anterior–posterior and inferior–superior, giving 128 × 144 × 128. The reasons:
+   - *Memory:* the crop needs 4.44 GiB of training memory in bf16, while the whole volume needs 7.80 GiB even with a batch of one (Section 2.3). The crop fits the 8 GB GPU with a batch of two volumes.
+   - *Usable at inference:* the box does not depend on the labels, so it can be applied to a new scan without ground truth.
+   - *Contains the organs:* bladder, rectum and prostate lie inside the box in all 211 volumes, except that the 144-plane training volume (case 019, week 1) loses its top 3 bladder slices.
+   - *Fits the network:* every side is divisible by 16, so the four stride-2 levels give whole-voxel sizes down to 8 × 9 × 8.
+
+   The cost is that body and bone are cut off at the edges of the box, so their Dice is only meaningful inside it. `predict.py` pastes the prediction back into a volume of the original shape.
+2. **No resampling:** volumes stay at their native spacing (1.41–1.88 mm in-plane, 1.56 mm between axial slices). Resampling to a common grid would interpolate the labels and require mapping predictions back, so the metrics would no longer be computed on the physicist's original voxels. The cost is that one voxel is not the same physical size in every patient: in-plane it varies from −16 % to +12 % of the most common 1.68 mm. The scale augmentation (0.9–1.1) covers most of this range. HD95 and all volumes in mL use each scan's own spacing from its Nifti header.
+3. **Normalise:** one z-score over the whole cropped volume. Unlike per-slice normalisation, this preserves the intensity differences between slices, which the 3D model compares.
+4. **Cache:** the cropped, normalised volumes are saved as `.npy` files on first use (about 2.5 GB for 211 volumes), because decompressing the Nifti files dominated the loading time.
+5. **Augment (training only, on the fly):**
+   - a left–right flip with p = 0.5;
+   - one affine grid that rotates by up to ±10° about each of the three axes and scales by 0.9–1.1, sampled trilinearly for the image and with nearest-neighbour for the mask, filling the exposed area with the volume's minimum (its background intensity after normalisation);
+   - intensity × U(0.9, 1.1) + U(−0.1, 0.1), to imitate differences in scanner gain.
+
+   The 3D model sees 191 training examples per epoch instead of 11,460, so it depends more on augmentation and dropout to avoid overfitting (Section 2.4).
+
+### 4.4 Scoring both models on the same voxels
+
+The 2D baseline predicts coronal slices, while the acceptance criteria are defined on volumes. For evaluation, `evaluate.py` flips each predicted slice *k* back left–right and writes it into coronal plane 98 + *k* of an empty volume. It then applies the same `CROP_3D`, so both models are scored on identical voxels against the same 3D labels. The planes outside the 60-slice 2D window are left as background. Before any metric is computed, `evaluate.py` asserts that two conditions hold for every test volume:
+- the re-assembled 2D ground truth is identical to the 3D label volume inside the window;
+- no test prostate lies outside the window.
+
+A failed check stops the evaluation, so the 2D baseline is never penalised for planes it could not see.
 
 ## 5. Usage
 <!-- TODO: how to run train.py and predict.py -->
