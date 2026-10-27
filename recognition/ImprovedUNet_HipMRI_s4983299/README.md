@@ -163,7 +163,7 @@ pip install -r requirements.txt
 | SciPy | 1.17.1 | HD95 distance transforms and connected components in `evaluate.py` |
 | Matplotlib | 3.11.1 | training curves and figures |
 
-The versions above are from the local environment (WSL2 Ubuntu 22.04, NVIDIA driver 616.56). The Rangpur environment used for the A100 runs: <!-- TODO: fill from Rangpur --> **to be filled**.
+The versions above are from the local environment (WSL2 Ubuntu 22.04, NVIDIA driver 616.56). The Rangpur `torch` environment used for the A100 runs has the same versions (Python 3.11.15, PyTorch 2.13.0 + CUDA 13.0, cuDNN 9.20, torchvision 0.28.0, nibabel 5.4.2, NumPy 2.4.6), except Matplotlib 3.11.2. SciPy is only needed by `evaluate.py`, which ran locally.
 
 ### 3.2 Hardware and training runs
 
@@ -260,7 +260,104 @@ The 2D baseline predicts coronal slices, while the acceptance criteria are defin
 A failed check stops the evaluation, so the 2D baseline is never penalised for planes it could not see.
 
 ## 5. Usage
-<!-- TODO: how to run train.py and predict.py -->
+
+Run every command from this folder (`recognition/ImprovedUNet_HipMRI_s4983299`) with the `torch` environment active (Section 3.1). By default the scripts read the 2D slices from `~/data/keras_slices_data` and the 3D volumes from `~/data/HipMRI_3D` (holding `semantic_MRs/` and `semantic_labels_only/`). Each script accepts `--root` to use another location.
+
+### 5.1 Get the data
+
+The data is on Rangpur under `/home/groups/comp3710/HipMRI_Study_open/`. Pack it there, then copy it to the local machine:
+
+```bash
+# on Rangpur
+cd /home/groups/comp3710/HipMRI_Study_open
+tar -cf ~/hipmri_2d.tar keras_slices_data
+tar -cf ~/hipmri_3d.tar semantic_MRs semantic_labels_only
+
+# on the local machine
+mkdir -p ~/data/HipMRI_3D
+cd ~/data && scp <username>@rangpur.compute.eait.uq.edu.au:hipmri_2d.tar . && tar -xf hipmri_2d.tar
+cd ~/data/HipMRI_3D && scp <username>@rangpur.compute.eait.uq.edu.au:hipmri_3d.tar . && tar -xf hipmri_3d.tar
+```
+
+Training on Rangpur reads the course directory directly, so no copy is needed there.
+
+### 5.2 Check the pipeline
+
+```bash
+python dataset.py --mode 2d       # split sizes, patient-disjoint check, one batch -> outputs/samples.png
+python dataset.py --mode 3d       # the same for volumes; also builds the .npy crop cache -> outputs/samples_3d.png
+python modules.py                 # output shapes, parameter counts and one bf16 training step of each model
+python scripts/audit2d.py         # 2D data audit (Section 2.3)
+python scripts/audit3d.py         # 3D data audit, including whether every organ fits inside CROP_3D
+python scripts/smoke_test.py      # 5-epoch 2D smoke test (Section 2.3)
+python scripts/profile3d.py       # 3D memory profile (Section 2.3)
+```
+
+### 5.3 Train
+
+`train.py --model unet` trains the 2D baseline and `--model improved3d` trains the 3D model. The data root, batch size and learning rate default to the values in Section 3.3. Each run writes to `runs/<model>_seed<seed>/` (or `--out`):
+
+| File | Content |
+|---|---|
+| `best.pth` | weights of the epoch with the highest validation prostate Dice; used by `evaluate.py` and `predict.py` |
+| `last.pth` | full training state of the latest epoch (model, optimiser, scheduler, random state), for `--resume` |
+| `history.json` | per-epoch losses and validation Dice, time and memory, final test metrics |
+| `curves.png` | training and validation loss, validation Dice per class |
+| `train.log` | the console output, written line by line |
+
+The four runs of Section 3.2 were produced with these commands:
+
+```bash
+# 3D Improved U-Net, seeds 0 and 1 (Rangpur A100, about 42 min each)
+EPOCHS=150 SEED=0 sbatch slurm/train3d.sh
+EPOCHS=150 SEED=1 sbatch slurm/train3d.sh
+
+# 2D U-Net, seed 0 (Rangpur A100, about 20 min)
+sbatch --account=comp3710 --partition=comp3710 --gres=gpu:1 --cpus-per-task=8 --job-name=unet2d \
+  --wrap "source ~/miniconda3/bin/activate torch && python train.py --model unet --seed 0 --epochs 30 \
+          --num-workers 8 --root /home/groups/comp3710/HipMRI_Study_open/keras_slices_data --out runs/unet_seed0"
+
+# 2D U-Net, seed 1 (local GPU)
+python train.py --model unet --seed 1 --epochs 30
+```
+
+A 3D run also fits a local 8 GB GPU: `python train.py --model improved3d --seed 0 --epochs 150`.
+
+Notes for Rangpur:
+- Submit from this folder, not from `slurm/`, because the script uses relative paths. Follow a run with `tail -f runs/improved3d_seed0/train.log`.
+- The `comp3710` partition needs `--account=comp3710` and rejects any `--mem` request, so `slurm/train3d.sh` sets the account and requests no memory.
+- The login node's NVIDIA driver supports only CUDA 11.2, so PyTorch prints *"The NVIDIA driver on your system is too old"* there and sees no GPU. This is expected: the GPU is only available inside a job on a compute node.
+- `slurm/train3d.sh` passes `--resume`, so re-submitting the same command after an interruption continues from `last.pth`. `train.py` stops if `--epochs` differs from the run being resumed, because the learning-rate schedule depends on it. To start a new run with a different length (for example after the 20-epoch pilot), move the old folder away first.
+- Copy the finished runs to the local machine for evaluation, for example `scp -r <username>@rangpur.compute.eait.uq.edu.au:<repo>/recognition/ImprovedUNet_HipMRI_s4983299/runs/improved3d_seed0 runs/`.
+
+### 5.4 Evaluate (Section 7)
+
+```bash
+python evaluate.py --ckpt2d runs/unet_seed0/best.pth runs/unet_seed1/best.pth \
+                   --ckpt3d runs/improved3d_seed0/best.pth runs/improved3d_seed1/best.pth \
+                   --out results/final
+```
+
+This scores every checkpoint on the 9 test volumes as described in Section 4.4, then averages the seeds of each model. It writes the following to `results/final/`:
+- `comparison.txt`: the result tables behind Section 7 (prostate metrics per run with the seed average and the run-to-run gap, error breakdown, results per volume and per patient, parameters and inference cost, and the selected failure cases);
+- `comparison.json`: the same numbers, machine-readable;
+- `apex_base_profile.png`: Dice along the inferior–superior axis;
+- `failure_<case>_wk<week>.png`: the automatically selected failure cases.
+
+### 5.5 Predict
+
+```bash
+# segment the first 3 test volumes: Dice per class and a figure per volume
+python predict.py --model improved3d --n 3
+
+# the 2D baseline on 4 test slices that contain prostate
+python predict.py --model unet --n 4
+
+# a new scan without a label: write the predicted mask as Nifti
+python predict.py --model improved3d --input path/to/B040_Week0_LFOV.nii.gz --save-nifti
+```
+
+The outputs go to `predictions/`: one PNG per volume (for example `test_case040_week0.png`, which is Figure 2) or `unet_test_slices.png`. With `--save-nifti`, the script also writes `<name>_pred.nii.gz`, which has the same shape and affine as the input scan, so it can be opened over the scan in a viewer such as 3D Slicer. `--ckpt` selects a checkpoint other than `runs/<model>_seed0/best.pth`.
 
 ## 6. Results
 <!-- TODO: example inputs/outputs, training curves -->
