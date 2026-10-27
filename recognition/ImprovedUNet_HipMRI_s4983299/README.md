@@ -2,8 +2,6 @@
 
 **Author:** Ruiqi Zuo (s4983299)
 
-> Work in progress.
-
 ## 1. Problem and Algorithm
 
 ### 1.1 The problem
@@ -330,7 +328,7 @@ Notes for Rangpur:
 - `slurm/train3d.sh` passes `--resume`, so re-submitting the same command after an interruption continues from `last.pth`. `train.py` stops if `--epochs` differs from the run being resumed, because the learning-rate schedule depends on it. To start a new run with a different length (for example after the 20-epoch pilot), move the old folder away first.
 - Copy the finished runs to the local machine for evaluation, for example `scp -r <username>@rangpur.compute.eait.uq.edu.au:<repo>/recognition/ImprovedUNet_HipMRI_s4983299/runs/improved3d_seed0 runs/`.
 
-### 5.4 Evaluate (Section 7)
+### 5.4 Evaluate (Sections 6.3 and 7)
 
 ```bash
 python evaluate.py --ckpt2d runs/unet_seed0/best.pth runs/unet_seed1/best.pth \
@@ -339,7 +337,7 @@ python evaluate.py --ckpt2d runs/unet_seed0/best.pth runs/unet_seed1/best.pth \
 ```
 
 This scores every checkpoint on the 9 test volumes as described in Section 4.4, then averages the seeds of each model. It writes the following to `results/final/`:
-- `comparison.txt`: the result tables behind Section 7 (prostate metrics per run with the seed average and the run-to-run gap, error breakdown, results per volume and per patient, parameters and inference cost, and the selected failure cases);
+- `comparison.txt`: the result tables behind Sections 6.3 and 7 (prostate Dice for the whole gland and its apex, central, base, anterior and posterior regions, HD95 and components, per run with the seed average and the run-to-run gap; Dice and IoU of every class on identical voxels; error breakdown; results per volume and per patient; parameters and inference cost; the selected failure cases);
 - `comparison.json`: the same numbers, machine-readable;
 - `apex_base_profile.png`: Dice along the inferior–superior axis;
 - `failure_<case>_wk<week>.png`: the automatically selected failure cases.
@@ -360,16 +358,242 @@ python predict.py --model improved3d --input path/to/B040_Week0_LFOV.nii.gz --sa
 The outputs go to `predictions/`: one PNG per volume (for example `test_case040_week0.png`, which is Figure 2) or `unet_test_slices.png`. With `--save-nifti`, the script also writes `<name>_pred.nii.gz`, which has the same shape and affine as the input scan, so it can be opened over the scan in a viewer such as 3D Slicer. `--ckpt` selects a checkpoint other than `runs/<model>_seed0/best.pth`.
 
 ## 6. Results
-<!-- TODO: example inputs/outputs, training curves -->
+
+All test numbers in this README come from `evaluate.py` (Section 5.4). `train.py` also logs test Dice at the end of each run, but on each model's own input (2D slices or the whole 3D crop), so those numbers cannot be compared between the models.
+
+### 6.1 Example input and output
+
+The input of the 3D model is one MR volume without labels. The output is a 6-class mask with the same shape and geometry. Figure 2 (Section 1) shows a test volume through the centre of the prostate in all three planes. The prediction follows the interfaces between the prostate, the bladder and the rectum, and at this scale the visible differences are confined to the organ boundaries. Section 7.3 shows where these boundary errors concentrate, next to the 2D baseline on the same voxels. `python predict.py --model unet` produces the equivalent figure for 2D slices.
+
+### 6.2 Training curves
+
+![Training curves, 2D U-Net](images/curves_unet_seed0.png)
+
+*Figure 3. 2D U-Net, seed 0: training and validation loss (left), and validation Dice per class with the prostate Dice averaged per scan, the checkpoint criterion (right, dashed). The dotted line is the 0.70 target.*
+
+![Training curves, 3D Improved U-Net](images/curves_improved3d_seed0.png)
+
+*Figure 4. 3D Improved U-Net, seed 0, with the same layout over 150 epochs.*
+
+| Run | Training loss, first → last epoch | Lowest validation loss | Best validation prostate Dice (epoch) | Validation prostate Dice, last epoch |
+|---|---|---|---|---|
+| 2D U-Net, seed 0 | 0.470 → 0.093 | 0.318 (epoch 24) | 0.861 (14) | 0.855 |
+| 2D U-Net, seed 1 | 0.562 → 0.095 | 0.314 (epoch 21) | 0.861 (23) | 0.856 |
+| 3D Improved U-Net, seed 0 | 0.919 → 0.095 | 0.204 (epoch 28) | 0.860 (38) | 0.829 |
+| 3D Improved U-Net, seed 1 | 0.961 → 0.093 | 0.209 (epoch 28) | 0.859 (74) | 0.844 |
+
+What the curves show:
+- **Both models converge early.** The 2D U-Net reaches its validation plateau within about 10 epochs and stays there. The training loss keeps falling, but the validation Dice does not drop, so 30 epochs neither under- nor over-trains it.
+- **The 3D model overfits mildly after about 30 epochs.** Its validation loss is lowest at epoch 28 in both runs and then rises slowly, and its validation prostate Dice ends 0.015–0.03 below its peak. Choosing the checkpoint on validation Dice therefore matters for the 3D model. By epoch 40 both runs were already within 0.002 of their best validation Dice. A schedule of about 60 epochs would therefore probably have been enough and would save roughly 60 % of the training time. This was not tested: a shorter cosine schedule also changes the learning rate at every epoch.
+- **The two models reach the same best validation prostate Dice** (0.861 vs 0.860), which already suggested that their global Dice on the test set would be close.
+- **The validation Dice of a single organ can dip for one epoch,** for example the 3D bladder curve at epoch 45. With only 11 validation volumes, one poorly segmented volume moves the mean.
+- The loss values of the two models are not comparable with each other, because they are averaged over different sets of voxels.
+
+### 6.3 Test results
+
+Dice and IoU per class on the 9 test volumes, as the mean ± std over volumes, averaged over the two seeds of each model:
+- The first two models are scored on the voxels that both models predict: the 60 coronal planes of the 2D slices inside the crop.
+- The last model scores the 3D model over its whole crop.
+- IoU is computed per volume as Dice / (2 − Dice), so it ranks the models in the same order as Dice.
+- The last row gives the gap between the two seeds' mean Dice.
+
+| Model, region | Metric | Body | Bone | Bladder | Rectum | Prostate |
+|---|---|---|---|---|---|---|
+| 2D U-Net, 2D window | Dice | 0.977 ± 0.003 | 0.942 ± 0.008 | **0.963** ± 0.010 | **0.863** ± 0.043 | 0.882 ± 0.011 |
+| | IoU | 0.956 ± 0.006 | 0.890 ± 0.015 | 0.928 ± 0.019 | 0.761 ± 0.064 | 0.788 ± 0.018 |
+| 3D Improved U-Net, 2D window | Dice | 0.976 ± 0.003 | 0.941 ± 0.006 | 0.959 ± 0.010 | 0.828 ± 0.094 | **0.886** ± 0.014 |
+| | IoU | 0.954 ± 0.005 | 0.889 ± 0.011 | 0.921 ± 0.019 | 0.718 ± 0.127 | 0.796 ± 0.023 |
+| 3D Improved U-Net, whole crop | Dice | 0.983 ± 0.002 | 0.930 ± 0.008 | 0.957 ± 0.010 | 0.806 ± 0.098 | 0.886 ± 0.014 |
+| | IoU | 0.967 ± 0.004 | 0.870 ± 0.013 | 0.918 ± 0.019 | 0.686 ± 0.131 | 0.796 ± 0.023 |
+| Gap between seeds (Dice), 2D / 3D, 2D window | | 0.001 / 0.001 | 0.001 / 0.002 | 0.001 / 0.006 | 0.030 / 0.030 | 0.006 / 0.001 |
+
+- **Prostate:** both models pass the 0.70 target (A1) by a wide margin. The 3D model is ahead by only 0.004, a difference smaller than the 2D model's gap between seeds.
+- **Body and bone:** the two models perform the same.
+- **Bladder:** the 3D model is lower on 7 of the 9 volumes and equal on the other 2, but only by 0.004 on average.
+- **Rectum:** the 3D model is lower by 0.035 on average, with twice the spread. It is better on 4 volumes and worse on 5. The mean is pulled down mainly by two scans of patient 040: week 1 (0.62 against 0.76 for 2D) and week 5 (0.75 against 0.86). The difference is about the size of the gap between seeds (0.030), so it is not a reliable ranking. It does show, however, that 3D context did not help with the organs at risk.
+- **3D model over the whole crop:** it scores lower on rectum and bone than inside the 2D window. The crop also contains rectum and bone in coronal planes outside the 60 planes of the 2D slices, and the 3D model is less accurate there. The prostate score does not change, because no test prostate lies outside the window (Section 4.4).
+
+These are global scores. Section 7 tests whether they hide differences at the apex and the base of the prostate, which is the actual dilemma.
 
 ## 7. Open Research Dilemma Investigation
+
+The question is whether true 3D context removes the dangerous boundary errors at the apex and the base of the prostate, or only improves the easy central slices at a higher GPU cost. Both models are scored on the same 9 test volumes (patients 040–042), on identical voxels (Section 4.4), with two training seeds each. All numbers come from `results/final/comparison.txt` (Section 5.4).
+
 ### 7.1 Baseline Comparison (2D U-Net vs 3D Improved U-Net)
+
+| Prostate metric | 2D U-Net | 3D Improved U-Net | 3D − 2D | Seed gap, 2D / 3D | 3D better on | Criterion | Met |
+|---|---|---|---|---|---|---|---|
+| Dice, whole gland | 0.882 ± 0.011 | 0.886 ± 0.014 | +0.004 | 0.006 / 0.001 | 6 of 9 volumes | A1: 3D ≥ 0.70 | ✅ |
+| Dice, apex | 0.651 ± 0.200 | 0.665 ± 0.130 | +0.014 | 0.011 / 0.011 | 3 of 9 | A2: ≥ 2D + 0.05 | ❌ |
+| Dice, central | 0.905 ± 0.012 | 0.919 ± 0.019 | +0.014 | 0.002 / 0.004 | 8 of 9 | A2: ≥ 2D − 0.01 | ✅ |
+| Dice, base | 0.755 ± 0.065 | 0.716 ± 0.054 | −0.039 | 0.050 / 0.042 | 3 of 9 | A2: ≥ 2D + 0.05 | ❌ |
+| Dice, anterior edge† | 0.674 ± 0.182 | 0.720 ± 0.124 | +0.046 | 0.154 / 0.011 | 5 of 9 | – | – |
+| Dice, posterior edge† | 0.527 ± 0.246 | 0.611 ± 0.254 | +0.084 | 0.083 / 0.033 | 5 of 9 | – | – |
+| HD95 (mm) | 3.34 ± 0.71 | 3.21 ± 0.49 | −0.13 | | 4 of 9 (4 worse, 1 equal) | A3: ≤ 2D | ✅ |
+| Connected components | 1.1 ± 0.2 | 1.0 ± 0.0 | −0.1 | | 2 of 9 (7 equal) | A3: ≤ 2D | ✅ |
+
+*Mean ± std over the 9 volumes, averaged over the two seeds. "3D better on" counts volumes on the seed-averaged metric. † The 3 most anterior / posterior prostate-bearing coronal planes plus everything beyond them, the same definition as apex and base but across coronal planes. This was added during the final analysis and is not a criterion from the check-off.*
+
+| Error type (mean per volume) | 2D U-Net | 3D Improved U-Net | 3D higher on |
+|---|---|---|---|
+| Missed prostate at the apex / base (FN, mL) | 0.34 / 0.17 | 0.19 / 0.09 | 1 / 1 of 9 |
+| Extra prostate at the apex / base (FP, mL) | 0.46 / 0.98 | 0.82 / 1.39 | 7 / 7 of 9 |
+| Prediction extends below the true apex / above the true base (mm) | 2.25 / 2.69 | 2.60 / 2.77 | |
+| Prostate predicted inside the bladder (mL) | 0.20 | 0.40 | **9 of 9** |
+| Prostate predicted inside the rectum (mL) | 0.00 | 0.01 | |
+
+| Patient (scans) | Dice, 2D / 3D | Apex, 2D / 3D | Base, 2D / 3D |
+|---|---|---|---|
+| 040 (7) | 0.883 / 0.885 | **0.754** / 0.687 | **0.754** / 0.717 |
+| 041 (1) | 0.875 / **0.899** | 0.194 / **0.836** | **0.838** / 0.728 |
+| 042 (1) | 0.875 / 0.882 | 0.384 / 0.342 | 0.681 / 0.700 |
+
+![Dice from apex to base](images/apex_base_profile.png)
+
+*Figure 5. Mean prostate Dice of the axial slices inside the true gland, from apex (0) to base (1), over the 9 test volumes and both seeds. Slices beyond the true gland are not included here, but they are included in the apex and base Dice in the table above.*
+
+Findings:
+1. **The only consistent gain is in the central gland:** +0.014 Dice, better on 8 of 9 volumes, and 3–7 times the gap between seeds. On the whole gland the gain shrinks to +0.004, below the 2D model's own gap between seeds. The 3D model mostly improves the slices that were already easy, which is the first half of the dilemma.
+2. **3D context does not fix the apex and the base, so A2 fails.**
+   - *Apex:* the mean gain of +0.014 comes from one volume, patient 041, where the 3D model rescues a 2D failure (0.19 → 0.84). The 3D model is better at the apex on only 3 of 9 volumes, and on patient 040 (7 scans) it is worse (0.754 → 0.687).
+   - *Base:* the 3D model is lower on 6 of 9 volumes. The mean difference (−0.039) is within the gap between seeds, so this is no gain rather than a proven loss.
+3. **The 3D model systematically over-contours.** At both ends it misses less tissue (FN lower on 8 of 9 volumes) but adds more (FP higher on 7 of 9), and it extends further below the apex. It also draws more prostate into the bladder than the 2D model on all 9 volumes, twice as much on average.
+   - Inside the true gland, the 3D model is equal or better at every position except the last tenth at the base (Figure 5).
+   - Its apex region nevertheless gains little, because the extra slices it predicts below the apex offset that gain.
+4. **3D context helps most where the 2D model is blind.** The 2D slices are coronal, so the 2D model sees the whole apex-to-base extent of the gland inside each slice. What it cannot see is the neighbouring coronal slice, which matters at the anterior and posterior surfaces of the gland. That is where the 3D model gains most on average (+0.046 anterior, +0.084 posterior) and where it is far more reproducible: the two 2D seeds differ by 0.154 at the anterior edge, the two 3D seeds by 0.011.
+   - The gains come from rescuing a few 2D failures, for example the posterior edge of 040 week 7 (0.27 → 0.75) and the anterior edge of 042 (0.28 → 0.57).
+   - Per volume it is still only 5 of 9, and the 3D model misses the posterior edge of 042 entirely (0.26 → 0.00).
+   - The posterior surface, where the prostate faces the rectum, is the least accurate region for both models.
+5. **Continuity and boundary distance favour the 3D model slightly.**
+   - *Continuity:* the 3D prediction is always a single connected component. The 2D model left a detached island in 2 of its 18 predictions (040 weeks 3 and 7, one seed each).
+   - *Boundary distance:* HD95 is 0.13 mm lower on average, which is less than one voxel, and is split 4–4 across volumes.
+6. **The evidence is thin.** There are only 3 independent test patients, and 7 of the 9 volumes come from patient 040. No significance test is meaningful at this size. The conclusions therefore rest on whether a difference is consistent across volumes and larger than the gap between seeds, not on the mean alone.
+
 ### 7.2 Resource Profiling
+
+| | 2D U-Net | 3D Improved U-Net | 3D / 2D |
+|---|---|---|---|
+| Parameters | 7,762,630 | 9,463,234 | 1.2× |
+| Peak training memory (bf16) | 0.85 GB (batch of 16 slices) | 4.44 GB (batch of 2 crops) | **5.2×** |
+| Training time per run, A100 (incl. validation) | 40.0 s × 30 epochs = 20 min | 16.9 s × 150 epochs = 42 min | 2.1× |
+| Time to the best validation epoch, seed 0 | 14 epochs ≈ 9 min | 38 epochs ≈ 11 min | 1.1× |
+| Inference per test volume, forward pass only, bf16 | 60–69 ms (60 slices in one batch) | 59–67 ms (one crop) | ≈ 1.0× |
+| Peak inference memory | 1.13 GB | 0.89 GB | 0.8× |
+
+*Memory is PyTorch's peak allocated memory, without the CUDA context. Training times are from the Rangpur A100. Inference was measured on the RTX 4070 Laptop GPU, and the range covers four repeated evaluations.*
+
+- **Memory is the real cost:** 3D training needs 5.2 times the memory of the 2D baseline, inside the 5–10× range that the dilemma anticipates. It fits an 8 GB GPU only because of the pelvic crop and bf16 (Section 2.3). Without the crop, training needs 7.80 GiB even with a batch of one, and fp32 runs out of memory even with the crop. A future model with more channels or a larger field of view would need an A100.
+- **Training time is not a 5–10× cost here.** The full 150-epoch run took 2.1 times the 2D run, and the training curves (Section 6.2) show that about 60 epochs would suffice, which would bring the 3D model level with the baseline. A 3D epoch is short because it sees 191 crops, while a 2D epoch sees 11,460 slices.
+- **Inference costs the same.** Both models segment a scan in well under the 1 s limit (A4). The 3D model needs less memory here, partly because the 2D model processes all 60 slices of a scan in one batch with twice as many channels per level (32 against 16).
+- **A4 is met:** training fits an 8 GB GPU and a single A100 job, inference takes under 0.1 s per volume, and the memory ratio is reported.
+
 ### 7.3 Failure Case Autopsy
+
+`evaluate.py` selects the cases automatically from the seed-averaged metrics, with four rules: the worst 3D apex, the worst 2D apex, the worst 3D base, and the largest regression of 3D against 2D at the apex or the base.
+
+Each figure shows three views, all cropped around the prostate:
+- *Rows:* a sagittal plane through the centre of the prostate, which shows the apex (bottom) and the base (top) together; then the axial slices at the apex and at the base where the two models differ most.
+- *Columns:* the MR image, the ground truth, and then the seed-0 prediction of each model.
+- *Colours of the predictions:* true positive yellow, false positive (extra) red, false negative (missed) cyan, with the bladder and rectum outlined.
+
+The panel titles give the seed-0 Dice. The text below gives seed-averaged values.
+
+![Failure case 041](images/failure_041_wk0.png)
+
+*Figure 6. Patient 041, week 0: the worst 2D apex.*
+
+**Case 1: the 2D model loses the apex (041, week 0; apex Dice 2D 0.194, 3D 0.836).** Both 2D seeds fail here. Their predictions stop on average 2.3 mm (one to two slices) above the true apex, and in the axial apex slice almost the whole gland is cyan. At this level the gland is small and has the same grey level as the surrounding pelvic-floor muscle (MR panel), so a single coronal slice gives little evidence of where it ends. The 3D model follows the gland down from the neighbouring slices and recovers it. This is the clearest case where 3D context helps.
+
+The same volume shows a 3D failure at the base (0.728 against 0.838). The 3D model adds a crescent of tissue behind the base (red, at the top of the axial base panel), most likely the seminal vesicles, which join the base from behind and are not part of the prostate label.
+
+![Failure case 042](images/failure_042_wk0.png)
+
+*Figure 7. Patient 042, week 0: the worst 3D apex.*
+
+**Case 2: an enlarged gland defeats both models (042, week 0; apex Dice 2D 0.384, 3D 0.342; posterior edge 0.256, 0.000).** This is the largest test gland, 67 mL over 32 axial slices, against 19–31 mL for the other test volumes.
+- *Apex and posterior surface:* both models miss a band along the inferior and posterior surface of the gland (cyan in the sagittal view). The 3D model stops 1.6 mm above the true apex, although on average it extends 2.6 mm below it.
+- *Base:* both models spill over the bladder neck (red across the bladder outline).
+
+Large glands do occur in training (25 volumes of 60 mL or more), but all of them come from only 4 of the 31 training patients. Both models seem to end the gland where a typical gland would end. Extra 3D context does not help when the anatomy itself is under-represented.
+
+![Failure case 040 week 0](images/failure_040_wk0.png)
+
+*Figure 8. Patient 040, week 0: the worst 3D base.*
+
+**Case 3: the base sits inside the bladder neck (040, week 0; base Dice 2D 0.693, 3D 0.650).** In the axial base slice the bladder wraps around the base on both sides, and the two are separated only by a thin wall of similar intensity.
+- *2D model:* it spreads a false-positive blob sideways and backwards while missing tissue at the back.
+- *3D model:* it misses tissue at the back and lays a rim of false positives along the bladder wall.
+
+At the apex, the 3D model draws a red ring around the gland and extends 4.7 mm below it (apex 0.645 against 0.809). The apex and base therefore fail in the same scan, for different reasons.
+
+![Failure case 040 week 1](images/failure_040_wk1.png)
+
+*Figure 9. Patient 040, week 1: the largest 3D regression against 2D.*
+
+**Case 4: the 3D model's systematic over-contouring (040, week 1; whole gland 2D 0.897, 3D 0.898; apex 0.767 → 0.619; base 0.758 → 0.657).**
+- *What the figure shows:* the 3D prediction has the right shape but is about one voxel too large all round. There is a thicker red rim in every view, and a red band below the apex in the sagittal view.
+- *Why the edge Dice collapses:* on the large central slices a one-voxel rim costs little Dice, but on the small apex and base cross-sections it is a large fraction of the area.
+- *Why it matters:* this volume shows the dilemma directly. The global Dice is unchanged while both ends of the gland get worse.
+- *Rectum:* this scan also has the 3D model's lowest rectum Dice (0.62 against 0.76, Section 6.3). I did not identify the cause.
+
+**A further failure without a figure: detached islands.** In 2 of its 18 predictions (040 weeks 3 and 7), the 2D model produced a second, disconnected prostate component. The 3D model never did. A detached island would add an isolated target volume that the planner must notice and delete.
+
+| Failure mode | Where | Model | Evidence | Likely trigger |
+|---|---|---|---|---|
+| Apex lost | apex | mainly 2D | Case 1 | small gland with the same grey level as the pelvic floor, little evidence within one coronal slice |
+| Uniform over-contouring by about one voxel | apex, base | 3D | Cases 3–4; FP higher on 7 of 9 volumes | not established. Candidates are the coarse, upscaled deep-supervision maps in the output sum, and the Dice term rewarding recall on small structures |
+| Spill into the bladder neck | base | both, 3D more | Cases 2–3; bladder overlap higher for 3D on 9 of 9 volumes | the base is cupped by the bladder, behind a thin wall of similar intensity |
+| Extra tissue behind the base | posterior base | 3D | Case 1 | probably the seminal vesicles |
+| Enlarged gland under-segmented | apex, posterior surface | both | Case 2 | large glands come from only 4 training patients |
+| Detached islands | anywhere | 2D | 040 weeks 3 and 7 | no continuity between coronal slices |
+
 ### 7.4 Recommendation to Project Manager
 
+**Bottom line:** 3D volumetric context does not justify itself on boundary safety.
+- *What it does not do:* it does not remove apex and base errors (A2 failed), it over-contours both ends of the gland, and it doubles the prostate drawn into the bladder.
+- *What it does do:* its real benefits are smaller. It gives a consistent gain in the central gland, steadier results between training runs, no detached fragments, and fewer catastrophic misses across the 2D model's coronal slices.
+- *What it costs:* 5.2 times the training memory, but the same inference time, and a full training run takes 42 minutes on one A100.
+
+Because the cost is modest, I recommend the 3D Improved U-Net as the drafting engine, but only inside a review protocol that trusts neither model at the edges of the gland. Section 2.4 planned this as the fallback if A2 failed.
+
+**Where spatial context gives a measurable gain:** the central gland, and the anterior and posterior surfaces, which are the 2D model's slice transitions.
+
+**Where it breaks down:** the apex and the base, the bladder interface, and enlarged glands.
+
+**Operating policy:**
+1. **Auto-draft, with routine review:** the central prostate slices (Dice 0.92), and the body, bone and bladder (Dice ≥ 0.93). The rectum (0.81–0.86) needs a closer check. Neither model is better than the other on the organs at risk, so they do not decide the choice of model.
+2. **Mandatory manual contouring or editing, for every patient and with either model:**
+   - *Apex and base:* the 3 most inferior and the 3 most superior prostate slices, about 5 mm at each end (apex and base Dice 0.65–0.76).
+   - *Posterior surface:* the surface facing the rectum (Dice 0.53–0.61).
+   - *Bladder interface at the base:* trim the 3D draft along the bladder wall, where it leaks on every test scan.
+3. **Not suitable for automated drafting: enlarged glands.** The one large test gland (67 mL) failed at the apex and the posterior surface with both models, and the training set holds only 4 patients with glands this size. Flag a scan for full manual contouring when its predicted prostate volume is large, for example above 50 mL. This threshold is a proposal and must be validated on more patients.
+4. **Hardware:** training needs an 8 GB GPU with the crop and bf16, or a Rangpur A100. Inference needs under 1 GB of allocated GPU memory and under 0.1 s per scan, so deployment cost is negligible.
+
+**Before any clinical use:**
+- *More test patients:* the evaluation covers only 3 independent patients, 7 of 9 scans come from one of them, and the differences between the models are of the same order as the variation between seeds.
+- *Recommended next experiments:*
+  - an erosion of the 3D prediction by one voxel, or a boundary-aware loss, to remove the over-contouring, which drives most of the apex, base and bladder errors;
+  - a 60-epoch 3D schedule;
+  - a cheaper 2.5D model that stacks neighbouring coronal slices as input channels, to test whether context across slices alone delivers the anterior and posterior gains.
+
 ## 8. Artificial Intelligence Usage Disclosure
-<!-- TODO: tools used, tasks assisted, how outputs were verified -->
+
+**Tool:** Claude Code (Anthropic, Claude Opus model) in VS Code, used throughout the project as an interactive pair programmer and writing assistant.
+
+**Tasks it assisted with:**
+- *Planning:* summarising the assessment specification, breaking the project into steps, and explaining the Git, Rangpur and Slurm workflow.
+- *Code:* drafting the first versions of `dataset.py`, `modules.py`, `train.py`, `evaluate.py`, `predict.py` and `slurm/train3d.sh` to my specification. The specification covered the model choice, the patient split, the crop, the metrics and the acceptance criteria. Where there were alternatives (for example cropping vs downsampling the volumes), the AI laid out the trade-offs and I chose. I read, ran and committed each part step by step, as the commit log shows.
+- *Debugging:* diagnosing the errors I hit, for example the resume crash, the Slurm account and memory errors, and a wrong path in a copy command.
+- *Writing:* drafting the README sections from my results and from the feasibility review I wrote for the check-off, and editing them for clarity.
+
+**How I verified the AI output:**
+- *Data and labels:* before training I ran the data audits (`scripts/`) and inspected sample figures of both pipelines. This caught a real AI error. The AI had inferred from 2D anatomy that labels 3 and 4 were rectum and bladder, assuming the slices were axial. The 3D audit in scanner coordinates showed that the slices are coronal and that labels 3 and 4 are bladder and rectum. I corrected the code and the report (Section 2, revision 1).
+- *Leakage:* `check_patient_disjoint` runs on every data load. The test split was used only for the final evaluation.
+- *Evaluation:* `evaluate.py` asserts that the re-assembled 2D labels equal the 3D labels before computing any metric (Section 4.4). The Nifti masks exported by `predict.py` have the same shape and affine as the input, and give the same prostate Dice as `evaluate.py` (0.884 on case 040, week 0). I checked every failure figure by eye against the metrics.
+- *Training code:* I interrupted and resumed runs on purpose. This exposed two bugs that were then fixed: a crash when restoring the random-number state, and a silent learning rate of 0 when the run length changed.
+- *Reported numbers:* every number in this README was traced back to a script output (`history.json`, `comparison.txt`, the audit and profiling scripts) and re-checked when the text was written. For example, the share of 256 × 144 slices was corrected from "about 1 %" to the measured 60 slices.
+
+I take full responsibility for all code, formulas and results in this submission.
 
 ## References
 
