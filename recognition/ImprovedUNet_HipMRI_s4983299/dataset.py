@@ -284,7 +284,8 @@ class HipMRI3DDataset(Dataset):
         meta:  dict with "case", "week"
 
     Cropped, normalised volumes are cached as .npy in `cache_dir` on first use,
-    because decompressing the Nifti files dominates loading time.
+    because decompressing the Nifti files dominates loading time. The default is
+    <root>/cache_crop, or ~/cache/hipmri3d_crop when `root` is read-only.
     """
 
     def __init__(self, root, split, augment=False, cache_dir=None):
@@ -294,8 +295,11 @@ class HipMRI3DDataset(Dataset):
         self.augment = augment
         mr_dir = os.path.join(root, "semantic_MRs")
         seg_dir = os.path.join(root, "semantic_labels_only")
-        self.cache_dir = cache_dir or os.path.join(root, "cache_crop")
-        os.makedirs(self.cache_dir, exist_ok=True)
+        if cache_dir is None:
+            cache_dir = os.path.join(root, "cache_crop")
+            if not os.access(root, os.W_OK):  # e.g. the read-only course directory on Rangpur
+                cache_dir = os.path.expanduser("~/cache/hipmri3d_crop")  # same as slurm/train3d.sh
+        self.cache_dir = cache_dir
 
         self.items = []  # (case, week, mr_path, seg_path)
         for n in sorted(os.listdir(mr_dir)):
@@ -317,6 +321,7 @@ class HipMRI3DDataset(Dataset):
         case, week, mr_path, seg_path = self.items[idx]
         stem = os.path.join(self.cache_dir, f"{case:03d}_week{week}")
         if not os.path.exists(stem + "_seg.npy"):
+            os.makedirs(self.cache_dir, exist_ok=True)
             img, seg = load_volume(mr_path, seg_path)
             np.save(stem + "_img.npy", img)
             np.save(stem + "_seg.npy", seg)  # written last: marks the pair as complete

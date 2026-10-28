@@ -292,7 +292,7 @@ def main():
     history["test_seconds_per_" + unit[:-1]] = infer_time
     if device.type == "cuda":
         history["peak_vram_gb"] = torch.cuda.max_memory_allocated() / 1024 ** 3
-        log(f"peak VRAM {history['peak_vram_gb']:.2f} GB (this session), "
+        log(f"peak VRAM {history['peak_vram_gb']:.2f} GiB (this session), "
             f"mean epoch {np.mean(history['epoch_time']):.1f}s, test {infer_time * 1000:.1f} ms/{unit[:-1]}")
     with open(os.path.join(args.out, "history.json"), "w") as f:
         json.dump(history, f, indent=2)

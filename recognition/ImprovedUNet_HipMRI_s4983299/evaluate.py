@@ -112,7 +112,7 @@ def predict_3d_volumes(model, root3d, device):
 
 @torch.no_grad()
 def time_inference(model, x, device, repeats=10):
-    """Pure forward-pass latency (s) and peak inference VRAM (GB) for input x."""
+    """Pure forward-pass latency (s) and peak inference VRAM (GiB) for input x."""
     x = x.to(device)
     with _autocast(device):
         model(x)  # warm-up
@@ -456,7 +456,7 @@ def format_report(seed_results, all_results, class_results, resources, failures,
     lines.append("")
     for name, r in resources.items():
         lines.append(f"{name:18s} params {r['params']:,}  inference {r['s_per_volume'] * 1000:.0f} ms/volume  "
-                     f"peak inference VRAM {r['infer_vram_gb']:.2f} GB")
+                     f"peak inference VRAM {r['infer_vram_gb']:.2f} GiB")
     lines += ["", "failure cases (chosen on run-averaged metrics, figures show run 0): "
               + ", ".join(f"case {k[0]:03d} wk {k[1]} ({why})" for k, why in failures)]
     lines += ["", "checkpoints:"] + [f"  {n} run {i}: {c}" for n, cs in ckpts.items() for i, c in enumerate(cs)]
