@@ -6,7 +6,7 @@
 
 ### 1.1 The problem
 
-External-beam radiotherapy for prostate cancer is planned on MR images on which the prostate (the target) and the neighbouring organs at risk, the bladder and the rectum, must be contoured slice by slice. Under-contouring the prostate risks leaving tumour untreated, while over-contouring irradiates the bladder wall or rectal mucosa. This project builds a *draft* contouring assistant on the HipMRI study: 211 pelvic MR volumes from 38 patients, each labelled in 3D by an MR physicist into background, body, bone, bladder, rectum and prostate. The prostate is the hardest class: it covers only 0.43 % of the 2D slice pixels, and its two ends, the **apex** (inferior, against the pelvic floor) and the **base** (superior, against the bladder), fade into low-contrast tissue. A good global Dice score can therefore hide failures exactly where they matter clinically. The project asks whether a fully 3D model fixes these apex and base errors compared with a standard 2D U-Net, or whether it only improves the easy central slices at a much higher GPU cost (Section 7).
+External-beam radiotherapy for prostate cancer is planned on MR images on which the prostate (the target) and the neighbouring organs at risk, the bladder and the rectum, must be contoured slice by slice. Under-contouring the prostate risks leaving tumour untreated, while over-contouring irradiates the bladder wall or rectal mucosa. This project builds a *draft* contouring assistant on the HipMRI study [3]: 211 pelvic MR volumes from 38 patients, each labelled in 3D by an MR physicist into background, body, bone, bladder, rectum and prostate. The prostate is the hardest class: it covers only 0.43 % of the 2D slice pixels, and its two ends, the **apex** (inferior, against the pelvic floor) and the **base** (superior, against the bladder), fade into low-contrast tissue. A good global Dice score can therefore hide failures exactly where they matter clinically. The project asks whether a fully 3D model fixes these apex and base errors compared with a standard 2D U-Net, or whether it only improves the easy central slices at a much higher GPU cost (Section 7).
 
 ### 1.2 How the algorithm works
 
@@ -66,7 +66,9 @@ flowchart TB
 ### 2.1 User Need, Scope and Acceptance Criteria
 
 **User:** a radiation therapist / MR physicist contouring the prostate and organs at risk (OARs) for external-beam radiotherapy planning.
+
 **Prototype:** a volumetric *draft* contouring assistant that proposes body, bone, rectum, bladder and prostate masks for the specialist to review and edit. It is not intended for unsupervised clinical use.
+
 **Dilemma addressed:** does true 3D context remove the base/apex and slice-transition errors of a 2D model, or does it only smooth easy central slices at several times the GPU cost?
 
 Acceptance criteria, evaluated per volume on the same 9 held-out test volumes (patients 40–42) for both models, at the original label resolution:
@@ -106,11 +108,13 @@ Every number in this section can be reproduced with the scripts in [`scripts/`](
 
 | Run | All | Coronal: anterior / central / posterior† | Axial: apex / central / base‡ | Other DSC: bladder / rectum / bone / body | Train VRAM | Epoch | Inference |
 |---|---|---|---|---|---|---|---|
-| Check-off | 0.843 | 0.655 / 0.864 / 0.578 | not computed | 0.903 / 0.876 / 0.935 / 0.978 | 1.5 GB | 69 s | 1.6 ms/slice |
+| Check-off | 0.843 | 0.655 / 0.864 / 0.578 | not computed | 0.903 / 0.876 / 0.935 / 0.978 | 1.5 GiB | 69 s | 1.6 ms/slice |
 | Re-run of current script | 0.854 | 0.708 / 0.875 / 0.578 | **0.695 / 0.872 / 0.561** | 0.885 / 0.889 / 0.936 / 0.978 | 1.50 GiB | –§ | –§ |
 
 † The 3 most anterior / posterior prostate-bearing coronal slices of each scan. At the check-off these two columns were labelled "apex / base". That was wrong: the 2D slices are coronal, so slice index runs anterior to posterior, not inferior to superior.
+
 ‡ True apex / base: the 3 most inferior / superior prostate-bearing axial planes of each scan plus everything beyond them, the same definition as `evaluate.py`.
+
 § Not reported for the re-run, because the laptop GPU was throttled at the time (185–278 s per epoch). Speeds for the final models come from the Rangpur A100 (Section 7.2).
 
 **3D Improved U-Net resource profile** (`scripts/profile3d.py`: random input, Adam, DiceCELoss, same 8 GB GPU). The check-off version of this table profiled downsampled inputs (64×128×128 and 128³) that were dropped after the 3D audit. This is the re-run for the two configurations actually considered:
@@ -124,7 +128,7 @@ Every number in this section can be reproduced with the scripts in [`scripts/`](
 
 \* Exceeds the 8 GB card; the WSL driver spilled into system RAM instead of failing.
 
-**Interpretation:** the 2D pipeline works end to end and already reaches 0.85 global DSC on validation. However, its prostate DSC falls from 0.87 in the central axial planes to 0.70 at the apex and 0.56 at the base. Edge errors hidden by a high global Dice are exactly the dilemma, and they are where 3D context should help. 3D training fits the 8 GB laptop GPU only with both bf16 and the pelvic crop: 4.44 GiB at 128 × 144 × 128, while fp32 at the same size runs out of memory. In the final bf16 runs, 3D training used 4.4 GB against 0.85 GB for the 2D baseline, 5.2× the memory. The whole volume would need 7.8 GiB in bf16 and 15.3 GiB in fp32, so full-resolution training without cropping is only practical on a Rangpur A100.
+**Interpretation:** the 2D pipeline works end to end and already reaches 0.85 global DSC on validation. However, its prostate DSC falls from 0.87 in the central axial planes to 0.70 at the apex and 0.56 at the base. Edge errors hidden by a high global Dice are exactly the dilemma, and they are where 3D context should help. 3D training fits the 8 GB laptop GPU only with both bf16 and the pelvic crop: 4.44 GiB at 128 × 144 × 128, while fp32 at the same size runs out of memory. In the final bf16 runs, 3D training used 4.44 GiB against 0.85 GiB for the 2D baseline, 5.2× the memory. The whole volume would need 7.8 GiB in bf16 and 15.3 GiB in fp32, so full-resolution training without cropping is only practical on a Rangpur A100.
 
 ### 2.4 Risks, Budget and Fallback
 
@@ -169,10 +173,10 @@ All reported results come from four training runs, two seeds per model:
 
 | Run | Hardware | Epochs | Time / epoch | Total | Best validation epoch | Peak training memory |
 |---|---|---|---|---|---|---|
-| 2D U-Net, seed 0 | Rangpur A100-PCIE-40GB | 30 | 40.0 s | 20 min | 14 | 0.85 GB |
-| 2D U-Net, seed 1 | RTX 4070 Laptop GPU, 8 GB | 30 | 199 s* | 99 min | 23 | 0.86 GB |
-| 3D Improved U-Net, seed 0 | Rangpur A100-PCIE-40GB | 150 | 16.9 s | 42 min | 38 | 4.44 GB |
-| 3D Improved U-Net, seed 1 | Rangpur A100-PCIE-40GB | 150 | 16.9 s | 42 min | 74 | 4.44 GB |
+| 2D U-Net, seed 0 | Rangpur A100-PCIE-40GB | 30 | 40.0 s | 20 min | 14 | 0.85 GiB |
+| 2D U-Net, seed 1 | RTX 4070 Laptop GPU, 8 GB | 30 | 199 s* | 99 min | 23 | 0.86 GiB |
+| 3D Improved U-Net, seed 0 | Rangpur A100-PCIE-40GB | 150 | 16.9 s | 42 min | 38 | 4.44 GiB |
+| 3D Improved U-Net, seed 1 | Rangpur A100-PCIE-40GB | 150 | 16.9 s | 42 min | 74 | 4.44 GiB |
 
 \* The laptop GPU was throttled during this run, so its time is not comparable with the A100 times.
 
@@ -204,6 +208,10 @@ Both models share the following settings:
 ## 4. Data Pre-processing and Splits
 
 The facts about the data (shapes, spacing, orientation, class balance) are in Section 2.3. This section describes what is done to the data and why. All of it is implemented in [`dataset.py`](dataset.py).
+
+Both models use the same two encodings:
+- **Intensities:** z-score normalisation, per slice for the 2D model (Section 4.2) and per volume for the 3D model (Section 4.3).
+- **Masks:** integer label maps (0–5) during loading, cropping and augmentation, so that nearest-neighbour resampling always gives valid labels. The loss expands them into six one-hot channels (`F.one_hot` in `DiceLoss`, [`modules.py`](modules.py)), and the soft Dice term compares these channels with the softmax output class by class. The cross-entropy term takes the label map directly.
 
 ### 4.1 Patient-level split
 
@@ -259,7 +267,7 @@ A failed check stops the evaluation, so the 2D baseline is never penalised for p
 
 ## 5. Usage
 
-Run every command from this folder (`recognition/ImprovedUNet_HipMRI_s4983299`) with the `torch` environment active (Section 3.1). By default the scripts read the 2D slices from `~/data/keras_slices_data` and the 3D volumes from `~/data/HipMRI_3D` (holding `semantic_MRs/` and `semantic_labels_only/`). Each script accepts `--root` to use another location.
+Run every command from this folder (`recognition/ImprovedUNet_HipMRI_s4983299`) with the `torch` environment active (Section 3.1). By default the scripts read the 2D slices from `~/data/keras_slices_data` and the 3D volumes from `~/data/HipMRI_3D` (holding `semantic_MRs/` and `semantic_labels_only/`). Each script accepts `--root` to use another location. The 3D scripts cache the cropped volumes as `.npy` files in `<root>/cache_crop`. When the data folder is read-only, as the course directory on Rangpur is, they use `~/cache/hipmri3d_crop` instead, the same folder that `slurm/train3d.sh` passes to `train.py --cache-dir`.
 
 ### 5.1 Get the data
 
@@ -355,7 +363,7 @@ python predict.py --model unet --n 4
 python predict.py --model improved3d --input path/to/B040_Week0_LFOV.nii.gz --save-nifti
 ```
 
-The outputs go to `predictions/`: one PNG per volume (for example `test_case040_week0.png`, which is Figure 2) or `unet_test_slices.png`. With `--save-nifti`, the script also writes `<name>_pred.nii.gz`, which has the same shape and affine as the input scan, so it can be opened over the scan in a viewer such as 3D Slicer. `--ckpt` selects a checkpoint other than `runs/<model>_seed0/best.pth`.
+The outputs go to `predictions/`: one PNG per volume (for example `test_case040_week0.png`, which is Figure 2) or `unet_test_slices.png`. With `--save-nifti`, the script also writes `<name>_pred.nii.gz`. For the 3D model this mask has the same shape and affine as the input scan, so it can be opened over the scan in a viewer such as 3D Slicer. For the 2D model it is the 256 × 128 cropped slice with an identity affine. `--ckpt` selects a checkpoint other than `runs/<model>_seed0/best.pth`.
 
 ## 6. Results
 
@@ -407,6 +415,7 @@ Dice and IoU per class on the 9 test volumes, as the mean ± std over volumes, a
 | | IoU | 0.967 ± 0.004 | 0.870 ± 0.013 | 0.918 ± 0.019 | 0.686 ± 0.131 | 0.796 ± 0.023 |
 | Gap between seeds (Dice), 2D / 3D, 2D window | | 0.001 / 0.001 | 0.001 / 0.002 | 0.001 / 0.006 | 0.030 / 0.030 | 0.006 / 0.001 |
 
+- **Target:** every class, not only the prostate, is above the 0.70 Dice target for both models. The lowest score is the 3D model's rectum over the whole crop (0.806).
 - **Prostate:** both models pass the 0.70 target (A1) by a wide margin. The 3D model is ahead by only 0.004, a difference smaller than the 2D model's gap between seeds.
 - **Body and bone:** the two models perform the same.
 - **Bladder:** the 3D model is lower on 7 of the 9 volumes and equal on the other 2, but only by 0.004 on average.
@@ -474,13 +483,13 @@ Findings:
 | | 2D U-Net | 3D Improved U-Net | 3D / 2D |
 |---|---|---|---|
 | Parameters | 7,762,630 | 9,463,234 | 1.2× |
-| Peak training memory (bf16) | 0.85 GB (batch of 16 slices) | 4.44 GB (batch of 2 crops) | **5.2×** |
+| Peak training memory (bf16) | 0.85 GiB (batch of 16 slices) | 4.44 GiB (batch of 2 crops) | **5.2×** |
 | Training time per run, A100 (incl. validation) | 40.0 s × 30 epochs = 20 min | 16.9 s × 150 epochs = 42 min | 2.1× |
 | Time to the best validation epoch, seed 0 | 14 epochs ≈ 9 min | 38 epochs ≈ 11 min | 1.1× |
 | Inference per test volume, forward pass only, bf16 | 60–69 ms (60 slices in one batch) | 59–67 ms (one crop) | ≈ 1.0× |
-| Peak inference memory | 1.13 GB | 0.89 GB | 0.8× |
+| Peak inference memory | 1.13 GiB | 0.89 GiB | 0.8× |
 
-*Memory is PyTorch's peak allocated memory, without the CUDA context. Training times are from the Rangpur A100. Inference was measured on the RTX 4070 Laptop GPU, and the range covers four repeated evaluations.*
+*Memory is PyTorch's peak allocated memory in GiB (2³⁰ bytes), without the CUDA context. Training times are from the Rangpur A100. Inference was measured on the RTX 4070 Laptop GPU, and the range covers four repeated evaluations.*
 
 - **Memory is the real cost:** 3D training needs 5.2 times the memory of the 2D baseline, inside the 5–10× range that the dilemma anticipates. It fits an 8 GB GPU only because of the pelvic crop and bf16 (Section 2.3). Without the crop, training needs 7.80 GiB even with a batch of one, and fp32 runs out of memory even with the crop. A future model with more channels or a larger field of view would need an A100.
 - **Training time is not a 5–10× cost here.** The full 150-epoch run took 2.1 times the 2D run, and the training curves (Section 6.2) show that about 60 epochs would suffice, which would bring the 3D model level with the baseline. A 3D epoch is short because it sees 191 crops, while a 2D epoch sees 11,460 slices.
@@ -520,7 +529,7 @@ Large glands do occur in training (25 volumes of 60 mL or more), but all of them
 
 *Figure 8. Patient 040, week 0: the worst 3D base.*
 
-**Case 3: the base sits inside the bladder neck (040, week 0; base Dice 2D 0.693, 3D 0.650).** In the axial base slice the bladder wraps around the base on both sides, and the two are separated only by a thin wall of similar intensity.
+**Case 3: the base sits inside the bladder neck (040, week 0; base Dice 2D 0.693, 3D 0.650).** The panel titles show seed 0, where the order at the base happens to be reversed (2D 0.631, 3D 0.667). The case was selected on the seed-averaged values given here. In the axial base slice the bladder wraps around the base on both sides, and the two are separated only by a thin wall of similar intensity.
 - *2D model:* it spreads a false-positive blob sideways and backwards while missing tissue at the back.
 - *3D model:* it misses tissue at the back and lays a rim of false positives along the bladder wall.
 
@@ -567,7 +576,7 @@ Because the cost is modest, I recommend the 3D Improved U-Net as the drafting en
    - *Posterior surface:* the surface facing the rectum (Dice 0.53–0.61).
    - *Bladder interface at the base:* trim the 3D draft along the bladder wall, where it leaks on every test scan.
 3. **Not suitable for automated drafting: enlarged glands.** The one large test gland (67 mL) failed at the apex and the posterior surface with both models, and the training set holds only 4 patients with glands this size. Flag a scan for full manual contouring when its predicted prostate volume is large, for example above 50 mL. This threshold is a proposal and must be validated on more patients.
-4. **Hardware:** training needs an 8 GB GPU with the crop and bf16, or a Rangpur A100. Inference needs under 1 GB of allocated GPU memory and under 0.1 s per scan, so deployment cost is negligible.
+4. **Hardware:** training needs an 8 GB GPU with the crop and bf16, or a Rangpur A100. Inference needs under 1 GiB of allocated GPU memory and under 0.1 s per scan, so deployment cost is negligible.
 
 **Before any clinical use:**
 - *More test patients:* the evaluation covers only 3 independent patients, 7 of 9 scans come from one of them, and the differences between the models are of the same order as the variation between seeds.
@@ -589,14 +598,20 @@ Because the cost is modest, I recommend the 3D Improved U-Net as the drafting en
 **How I verified the AI output:**
 - *Data and labels:* before training I ran the data audits (`scripts/`) and inspected sample figures of both pipelines. This caught a real AI error. The AI had inferred from 2D anatomy that labels 3 and 4 were rectum and bladder, assuming the slices were axial. The 3D audit in scanner coordinates showed that the slices are coronal and that labels 3 and 4 are bladder and rectum. I corrected the code and the report (Section 2, revision 1).
 - *Leakage:* `check_patient_disjoint` runs on every data load. The test split was used only for the final evaluation.
-- *Evaluation:* `evaluate.py` asserts that the re-assembled 2D labels equal the 3D labels before computing any metric (Section 4.4). The Nifti masks exported by `predict.py` have the same shape and affine as the input, and give the same prostate Dice as `evaluate.py` (0.884 on case 040, week 0). I checked every failure figure by eye against the metrics.
+- *Evaluation:* `evaluate.py` asserts that the re-assembled 2D labels equal the 3D labels before computing any metric (Section 4.4). The 3D Nifti masks exported by `predict.py` have the same shape and affine as the input, and give the same prostate Dice as `evaluate.py` (0.874 on case 040, week 0). I checked every failure figure by eye against the metrics.
 - *Training code:* I interrupted and resumed runs on purpose. This exposed two bugs that were then fixed: a crash when restoring the random-number state, and a silent learning rate of 0 when the run length changed.
 - *Reported numbers:* every number in this README was traced back to a script output (`history.json`, `comparison.txt`, the audit and profiling scripts) and re-checked when the text was written. For example, the share of 256 × 144 slices was corrected from "about 1 %" to the measured 60 slices.
 
 I take full responsibility for all code, formulas and results in this submission.
+
+## Acknowledgements
+
+Data were provided by HipMRI Study [3], through the COMP3710 course directory on Rangpur.
 
 ## References
 
 [1] O. Ronneberger, P. Fischer, and T. Brox, "U-Net: Convolutional networks for biomedical image segmentation," in *Proc. MICCAI*, 2015, pp. 234–241.
 
 [2] F. Isensee, P. Kickingereder, W. Wick, M. Bendszus, and K. H. Maier-Hein, "Brain tumor segmentation and radiomics survival prediction: Contribution to the BRATS 2017 challenge," in *Brainlesion: Glioma, Multiple Sclerosis, Stroke and TBI*, 2018, pp. 287–297.
+
+[3] J. A. Dowling *et al.*, "Automatic substitute computed tomography generation and contouring for magnetic resonance imaging (MRI)-alone external beam radiation therapy from standard MRI sequences," *Int. J. Radiat. Oncol. Biol. Phys.*, vol. 93, no. 5, pp. 1144–1153, 2015, doi: 10.1016/j.ijrobp.2015.08.045.
